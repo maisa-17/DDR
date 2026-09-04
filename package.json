@@ -1,0 +1,49 @@
+{
+  "name": "daily-data-records",
+  "version": "1.0.0",
+  "description": "Daily Data Records desktop app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "pack": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "png-to-ico": "^3.0.2",
+    "sharp": "^0.35.4"
+  },
+  "build": {
+    "appId": "com.dailydata.ddr",
+    "productName": "DDR",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "close_excel.ps1",
+      "icon.ico",
+      "node_modules/**/*"
+    ],
+    "asarUnpack": [
+      "close_excel.ps1"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DDR"
+    }
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
