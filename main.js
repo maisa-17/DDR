@@ -1,19 +1,24 @@
 const { app, BrowserWindow, ipcMain, Menu, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
-const XLSX = require('xlsx');
+const ExcelJS = require('exceljs');
 
 const DATA_FILE = path.join(app.getPath('userData'), 'entries.json');
 const ARCHIVE_FILE = path.join(app.getPath('userData'), 'entries_archive.json');
-const DOCS_DIR = path.join(app.getPath('documents'), 'DDR');
+// Installed app writes to Documents\DDR; a source/dev run (npm start) writes to a
+// separate folder so the two never fight over the same workbook.
+const DOCS_DIR = path.join(app.getPath('documents'), app.isPackaged ? 'DDR' : 'DDR-dev');
 const EXCEL_FILE = path.join(DOCS_DIR, 'service_entries_database.xlsx');
 const EXCEL_SHEET = 'Entries';
-const CLOSE_SCRIPT = app.isPackaged
-  ? path.join(process.resourcesPath, 'app.asar.unpacked', 'close_excel.ps1')
-  : path.join(__dirname, 'close_excel.ps1');
+const BACKUPS_DIR = path.join(DOCS_DIR, 'Backups');
+const BACKUP_FILE = path.join(BACKUPS_DIR, 'service_entries_database_backup.xlsx');
+// Off-site copy: Google Drive is mounted as G:\ (Drive File Stream) on this PC.
+// Only ever read from here to check it's mounted - never rely on it being there.
+const GDRIVE_ROOT = 'G:\\My Drive';
+const GDRIVE_BACKUPS_DIR = path.join(GDRIVE_ROOT, 'DDR Backups');
+const GDRIVE_BACKUP_FILE = path.join(GDRIVE_BACKUPS_DIR, 'service_entries_database_backup.xlsx');
 
-const HEADERS = ['Date','Time','Name','Mobile','Type','Source','Method','Location','Main Service','Sub Service',
+const HEADERS =['Date','Time','Name','Mobile','Type','Source','Method','Location','Main Service','Sub Service',
   'Charge','Payment Mode','Pending','Pending Rec.','Deductions','Deduction Amount','Commission','Ref','Remarks'];
 
 function readJSON(file, fallback) {
@@ -33,41 +38,276 @@ function ensureDocsDir() {
   if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR, { recursive: true });
 }
 
-function writeExcelFromArchive(archive) {
-  ensureDocsDir();
-  const ws = XLSX.utils.aoa_to_sheet([HEADERS, ...archive]);
-  ws['!cols'] = HEADERS.map(() => ({ wch: 14 }));
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, EXCEL_SHEET);
-  XLSX.writeFile(wb, EXCEL_FILE);
+// --- Excel mirror (ExcelJS) --------------------------------------------------
+// ExcelJS round-trips other worksheets with their styling, number formats,
+// column widths, merged cells, data validation and formulas intact. Charts and
+// embedded images are still not preserved by any free library.
+
+// Blank fields become a real empty-string cell (not a missing cell), so every
+// data row spans the full HEADERS width instead of stopping at its last value.
+function cellValue(v) {
+  return (v === undefined || v === null) ? '' : v;
 }
 
-function closeExcelIfOpen() {
-  return new Promise((resolve) => {
-    execFile('powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', CLOSE_SCRIPT, '-Path', EXCEL_FILE],
-      { timeout: 6000 },
-      () => resolve() // best-effort: proceed regardless of outcome
-    );
+// Give existing data rows a cell in every column (fills gaps left by rows that
+// were written before this — only adds empty cells, never changes a value).
+function fillRowGaps(ws) {
+  let changed = false;
+  const N = HEADERS.length;
+  for (let rn = 2; rn <= ws.rowCount; rn++) {
+    const row = ws.getRow(rn);
+    if (row.actualCellCount === 0) continue; // leave entirely-empty rows alone
+    for (let c = 1; c <= N; c++) {
+      const cell = row.getCell(c);
+      if (cell.type === ExcelJS.ValueType.Null) { cell.value = ''; changed = true; }
+    }
+  }
+  return changed;
+}
+
+function cellToPlain(v) {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (Array.isArray(v.richText)) return v.richText.map((t) => t.text).join('');
+    if ('result' in v) return v.result == null ? '' : v.result; // formula -> cached value
+    if ('text' in v) return v.text;                              // hyperlink
+    if (v instanceof Date) return v.toISOString();
+    return '';
+  }
+  return v;
+}
+
+function normCell(v) { return v == null ? '' : v; }
+function rowKey(row, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(normCell(row[i]));
+  return JSON.stringify(out);
+}
+
+// Data rows currently in the "Entries" worksheet (excludes the header row).
+function entriesDataRowCount(ws) {
+  if (!ws) return 0;
+  return Math.max(0, ws.actualRowCount - 1);
+}
+
+async function openWorkbook() {
+  if (!fs.existsSync(EXCEL_FILE)) return null;
+  try {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(EXCEL_FILE);
+    return wb;
+  } catch (e) {
+    return null; // locked / unreadable -> caller decides
+  }
+}
+
+// A 0-byte file (an interrupted write got killed before it wrote anything)
+// has nothing in it to protect, so treat it the same as "no file yet" and let
+// DDR rebuild the Entries sheet from the archive instead of refusing forever.
+// Anything else that exists but can't be read (locked, genuinely corrupt) is
+// left alone - see the "unreadable" guard below.
+function excelFileMissingOrEmpty() {
+  try {
+    if (!fs.existsSync(EXCEL_FILE)) return true;
+    return fs.statSync(EXCEL_FILE).size === 0;
+  } catch (e) {
+    return true;
+  }
+}
+
+// Keep exactly ONE local backup file, refreshed at most once per day (first
+// write of the day) - never a growing list of dated copies. The archive JSON
+// only protects the Entries data - custom sheets (D_repo, Guidelines, ...)
+// live nowhere but this file, so this is their only safety net if the live
+// copy is ever damaged. Best-effort: a backup failure must never block the
+// real write.
+function backupExcelFileIfDue() {
+  try {
+    if (excelFileMissingOrEmpty()) return; // nothing good to preserve yet
+    if (!fs.existsSync(BACKUPS_DIR)) fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+
+    let alreadyToday = false;
+    try { alreadyToday = fs.statSync(BACKUP_FILE).mtime.toDateString() === new Date().toDateString(); } catch (e) { /* no backup yet */ }
+    if (!alreadyToday) fs.copyFileSync(EXCEL_FILE, BACKUP_FILE);
+  } catch (e) { /* best-effort only */ }
+}
+
+// Off-site copy of the same single backup into Google Drive (G:\My Drive), so
+// a disk failure / theft / fire that takes out this PC doesn't take the backup
+// with it. One file, refreshed at most once per day. Silently does nothing if
+// Drive isn't mounted or signed in - this must never block or fail the real write.
+function backupToGoogleDriveIfDue() {
+  try {
+    if (excelFileMissingOrEmpty()) return;
+    if (!fs.existsSync(GDRIVE_ROOT)) return; // Drive for Desktop not running/signed in - skip quietly
+    if (!fs.existsSync(GDRIVE_BACKUPS_DIR)) fs.mkdirSync(GDRIVE_BACKUPS_DIR, { recursive: true });
+
+    let alreadyToday = false;
+    try { alreadyToday = fs.statSync(GDRIVE_BACKUP_FILE).mtime.toDateString() === new Date().toDateString(); } catch (e) { /* no backup yet */ }
+    if (!alreadyToday) fs.copyFileSync(EXCEL_FILE, GDRIVE_BACKUP_FILE);
+  } catch (e) { /* best-effort only */ }
+}
+
+// Write to a temp file in the same folder, then rename over the real workbook.
+// A rename is a near-instant metadata swap, so a crash/kill/power-loss during
+// the (slower) write only ever leaves a stray .tmp file - the real workbook is
+// either the old good copy or the new one, never a truncated 0-byte file.
+async function atomicWriteWorkbook(wb) {
+  backupExcelFileIfDue();      // snapshot the pre-change state before it's replaced
+  backupToGoogleDriveIfDue();  // ...and the same snapshot, off-site
+
+  // best-effort sweep of any .tmp file orphaned by a previous crash/kill
+  try {
+    const prefix = path.basename(EXCEL_FILE) + '.tmp-';
+    for (const f of fs.readdirSync(DOCS_DIR)) {
+      if (f.startsWith(prefix)) { try { fs.unlinkSync(path.join(DOCS_DIR, f)); } catch (e) { /* ignore */ } }
+    }
+  } catch (e) { /* ignore */ }
+
+  const tmp = EXCEL_FILE + '.tmp-' + process.pid + '-' + Date.now();
+  try {
+    await wb.xlsx.writeFile(tmp);
+    fs.renameSync(tmp, EXCEL_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* best effort cleanup */ }
+    throw e;
+  }
+}
+
+// True while the workbook is open in Excel. Excel reads the file into memory and
+// releases the handle, so we can't rely on a file lock - instead we look for the
+// "~$<name>" owner file Excel keeps beside it for the whole session. DDR must not
+// write the workbook while this is true, or Excel drops the disk change / turns
+// the open copy read-only.
+function isExcelFileOpen() {
+  const base = path.basename(EXCEL_FILE);
+  const owners = ['~$' + base, '~$' + base.slice(2)];
+  return owners.some((name) => {
+    try { return fs.existsSync(path.join(DOCS_DIR, name)); } catch (e) { return false; }
   });
+}
+
+function newEntriesSheet(wb) {
+  const ws = wb.addWorksheet(EXCEL_SHEET);
+  ws.columns = HEADERS.map((h) => ({ header: h, width: 14 }));
+  return ws;
+}
+
+// Files touched by SheetJS (and re-emitted by ExcelJS) carry
+// defaultRowHeight="0", which collapses every row that has no explicit height -
+// so the grid below the data looks like an empty grey void and its cells can't
+// be clicked. Restore Excel's normal default; leave any real custom height alone.
+function fixRowHeights(wb) {
+  let changed = false;
+  for (const ws of wb.worksheets) {
+    const h = ws.properties && ws.properties.defaultRowHeight;
+    if (!h || h < 5) {
+      ws.properties.defaultRowHeight = 15;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// Mirror the archive into the "Entries" sheet by APPENDING only the rows it does
+// not already have. Existing rows are never rewritten and the user's other
+// sheets / extra columns / styling are never touched. A fresh sheet (or
+// workbook) is created only when none exists yet.
+async function writeExcelFromArchive(archive) {
+  ensureDocsDir();
+  const fileExists = !excelFileMissingOrEmpty();
+
+  // Never write while the user has the workbook open - the entry is safe in the
+  // archive and the pending-sync loop applies it once Excel is closed.
+  if (fileExists && isExcelFileOpen()) {
+    throw new Error('Excel file is open - changes will sync when you close it');
+  }
+
+  const wb = fileExists ? await openWorkbook() : new ExcelJS.Workbook();
+
+  // Present but unreadable (open in Excel, or an unexpected format). Never
+  // overwrite it blind - let the caller retry or stay pending.
+  if (fileExists && !wb) throw new Error('Excel file exists but could not be opened');
+
+  let ws = wb.getWorksheet(EXCEL_SHEET);
+  if (!ws) {
+    ws = newEntriesSheet(wb);
+    for (const row of archive) ws.addRow(row.map(cellValue));
+    fixRowHeights(wb);
+    await atomicWriteWorkbook(wb);
+    return;
+  }
+
+  const missing = archive.slice(entriesDataRowCount(ws));
+  const gapsFilled = fillRowGaps(ws);
+  const heightsFixed = fixRowHeights(wb);
+  for (const row of missing) ws.addRow(row.map(cellValue));
+  if (missing.length === 0 && !gapsFilled && !heightsFixed) return;  // already up to date
+  await atomicWriteWorkbook(wb);
+}
+
+// Overwrite one row of the "Entries" sheet in place (for an edited entry),
+// keeping that row's formatting. Matches on the row's previous values (exact,
+// then a loose date/time/name/mobile key); if it still cannot be found the
+// corrected row is appended so the edit is never lost. Other sheets and any
+// extra columns are left alone.
+async function updateExcelRow(oldRow, newRow) {
+  ensureDocsDir();
+  if (isExcelFileOpen()) {
+    throw new Error('Excel file is open - changes will sync when you close it');
+  }
+  const wb = await openWorkbook();
+  if (!wb) throw new Error('workbook unavailable');
+  const ws = wb.getWorksheet(EXCEL_SHEET);
+  if (!ws) throw new Error('no Entries sheet');
+
+  const N = HEADERS.length;
+  const exact = rowKey(oldRow, N);
+  const loose = JSON.stringify([0, 1, 2, 3].map((j) => String(normCell(oldRow[j]))));
+
+  let exactRow = -1;
+  let looseRow = -1;
+  for (let rn = ws.rowCount; rn >= 2; rn--) {
+    const vals = ws.getRow(rn).values; // 1-indexed; [0] is empty
+    const arr = [];
+    for (let c = 1; c <= N; c++) arr.push(cellToPlain(vals[c]));
+    if (exactRow === -1 && rowKey(arr, N) === exact) exactRow = rn;
+    if (looseRow === -1 &&
+        JSON.stringify([0, 1, 2, 3].map((j) => String(normCell(arr[j])))) === loose) looseRow = rn;
+    if (exactRow !== -1) break;
+  }
+
+  const rn = exactRow !== -1 ? exactRow : looseRow;
+  if (rn === -1) {
+    ws.addRow(newRow.map(cellValue)); // not found -> append
+  } else {
+    const row = ws.getRow(rn);
+    for (let c = 1; c <= N; c++) row.getCell(c).value = cellValue(newRow[c - 1]);
+  }
+  fixRowHeights(wb);
+  await atomicWriteWorkbook(wb);
+  return rn !== -1;
 }
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function writeExcelWithRetry(archive, attempts = 6) {
+async function withRetry(fn, attempts = 6) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
-      writeExcelFromArchive(archive);
-      return;
+      return await fn();
     } catch (e) {
       lastErr = e;
       await delay(400);
     }
   }
   throw lastErr;
+}
+
+function writeExcelWithRetry(archive, attempts = 6) {
+  return withRetry(() => writeExcelFromArchive(archive), attempts);
 }
 
 function createWindow() {
@@ -85,10 +325,10 @@ function createWindow() {
   win.loadFile('index.html');
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   try {
     const archive = readJSON(ARCHIVE_FILE, []);
-    if (archive.length > 0) writeExcelFromArchive(archive);
+    if (archive.length > 0) await writeExcelFromArchive(archive);
   } catch (e) { /* will retry on next entry */ }
   createWindow();
   app.on('activate', () => {
@@ -103,14 +343,14 @@ app.on('window-all-closed', () => {
 ipcMain.handle('get-entries', () => readJSON(DATA_FILE, []));
 ipcMain.handle('set-entries', (event, entries) => { writeJSON(DATA_FILE, entries); return true; });
 
-ipcMain.handle('append-excel-row', (event, row) => {
+ipcMain.handle('append-excel-row', async (event, row) => {
   // Record into the permanent archive first (plain JSON, can't be locked by Excel).
   const archive = readJSON(ARCHIVE_FILE, []);
   archive.push(row);
   writeJSON(ARCHIVE_FILE, archive);
 
   try {
-    writeExcelFromArchive(archive);
+    await writeExcelFromArchive(archive);
     return { ok: true, path: EXCEL_FILE };
   } catch (e) {
     // Row is safe in the archive regardless; it will be written on the next
@@ -125,7 +365,7 @@ ipcMain.handle('append-excel-row', (event, row) => {
 //  - archive present            -> append only working-list rows not already in it
 //  - archive present but broken -> leave it untouched (rebuilding could drop rows)
 // The common case (archive already a superset of the working list) writes nothing.
-ipcMain.handle('seed-archive-if-empty', (event, rows) => {
+ipcMain.handle('seed-archive-if-empty', async (event, rows) => {
   const fileExists = fs.existsSync(ARCHIVE_FILE);
   const existing = readJSON(ARCHIVE_FILE, []);
 
@@ -146,7 +386,7 @@ ipcMain.handle('seed-archive-if-empty', (event, rows) => {
 
   if (!fileExists || merged > 0) {
     writeJSON(ARCHIVE_FILE, archive);
-    try { writeExcelFromArchive(archive); } catch (e) { /* will retry on next entry */ }
+    try { await writeExcelFromArchive(archive); } catch (e) { /* will retry on next entry */ }
   }
   return { seeded: !fileExists, merged, count: archive.length };
 });
@@ -182,9 +422,12 @@ ipcMain.handle('update-excel-row', async (event, oldRow, newRow) => {
 
   writeJSON(ARCHIVE_FILE, archive);
 
-  await closeExcelIfOpen();
   try {
-    await writeExcelWithRetry(archive);
+    if (!excelFileMissingOrEmpty()) {
+      await withRetry(() => updateExcelRow(oldRow, newRow)); // overwrite that row in place
+    } else {
+      await writeExcelWithRetry(archive);                    // no file yet (or 0 bytes) -> (re)create it
+    }
     return { ok: true, path: EXCEL_FILE, matched };
   } catch (e) {
     // Archive already updated; the renderer's pending-sync loop will finish it.
@@ -195,7 +438,6 @@ ipcMain.handle('update-excel-row', async (event, oldRow, newRow) => {
 ipcMain.handle('resync-excel', async () => {
   const archive = readJSON(ARCHIVE_FILE, []);
   if (archive.length === 0) return { ok: true, path: EXCEL_FILE, count: 0 };
-  await closeExcelIfOpen();
   try {
     await writeExcelWithRetry(archive);
     return { ok: true, path: EXCEL_FILE, count: archive.length };
@@ -206,7 +448,6 @@ ipcMain.handle('resync-excel', async () => {
 
 ipcMain.handle('open-excel-file', async () => {
   const archive = readJSON(ARCHIVE_FILE, []);
-  await closeExcelIfOpen();
   if (archive.length > 0) {
     try { await writeExcelWithRetry(archive); } catch (e) { /* open whatever's on disk */ }
   }
