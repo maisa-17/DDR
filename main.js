@@ -5,6 +5,11 @@ const ExcelJS = require('exceljs');
 
 const DATA_FILE = path.join(app.getPath('userData'), 'entries.json');
 const ARCHIVE_FILE = path.join(app.getPath('userData'), 'entries_archive.json');
+// Rows the user deleted from the working list + Excel. The archive itself is
+// never trimmed (append-only permanent record) - this is just a "don't show
+// these in Excel any more" list, so a deleted row can still be recovered from
+// the archive by hand if it's ever needed.
+const DELETED_FILE = path.join(app.getPath('userData'), 'deleted_rows.json');
 // Installed app writes to Documents\DDR; a source/dev run (npm start) writes to a
 // separate folder so the two never fight over the same workbook.
 const DOCS_DIR = path.join(app.getPath('documents'), app.isPackaged ? 'DDR' : 'DDR-dev');
@@ -84,10 +89,30 @@ function rowKey(row, n) {
   return JSON.stringify(out);
 }
 
-// Data rows currently in the "Entries" worksheet (excludes the header row).
-function entriesDataRowCount(ws) {
-  if (!ws) return 0;
-  return Math.max(0, ws.actualRowCount - 1);
+function readDeletedKeys() {
+  return new Set(readJSON(DELETED_FILE, []));
+}
+function addDeletedKey(key) {
+  const keys = readJSON(DELETED_FILE, []);
+  if (!keys.includes(key)) { keys.push(key); writeJSON(DELETED_FILE, keys); }
+}
+
+// Map every data row currently in the sheet, by content, to the row number(s)
+// it's on (usually one, but a Map of arrays copes if a row is ever duplicated).
+function sheetRowIndex(ws) {
+  const N = HEADERS.length;
+  const map = new Map();
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    if (row.actualCellCount === 0) continue;
+    const vals = row.values;
+    const arr = [];
+    for (let c = 1; c <= N; c++) arr.push(cellToPlain(vals[c]));
+    const k = rowKey(arr, N);
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(r);
+  }
+  return map;
 }
 
 async function openWorkbook() {
@@ -209,10 +234,13 @@ function fixRowHeights(wb) {
   return changed;
 }
 
-// Mirror the archive into the "Entries" sheet by APPENDING only the rows it does
-// not already have. Existing rows are never rewritten and the user's other
-// sheets / extra columns / styling are never touched. A fresh sheet (or
-// workbook) is created only when none exists yet.
+// Mirror the archive into the "Entries" sheet: append rows it doesn't have yet
+// and remove rows that were deleted (see DELETED_FILE) but couldn't be removed
+// at delete-time (e.g. Excel was open). Matching is by row CONTENT, not
+// position, so this stays correct even after a deletion shifts everything
+// below it up by one row. Existing (non-deleted) rows are never rewritten and
+// the user's other sheets / extra columns / styling are never touched. A
+// fresh sheet (or workbook) is created only when none exists yet.
 async function writeExcelFromArchive(archive) {
   ensureDocsDir();
   const fileExists = !excelFileMissingOrEmpty();
@@ -229,20 +257,38 @@ async function writeExcelFromArchive(archive) {
   // overwrite it blind - let the caller retry or stay pending.
   if (fileExists && !wb) throw new Error('Excel file exists but could not be opened');
 
+  const N = HEADERS.length;
+  const deletedKeys = readDeletedKeys();
+
   let ws = wb.getWorksheet(EXCEL_SHEET);
   if (!ws) {
     ws = newEntriesSheet(wb);
-    for (const row of archive) ws.addRow(row.map(cellValue));
+    for (const row of archive) {
+      if (deletedKeys.has(rowKey(row, N))) continue; // don't resurrect a deleted entry
+      ws.addRow(row.map(cellValue));
+    }
     fixRowHeights(wb);
     await atomicWriteWorkbook(wb);
     return;
   }
 
-  const missing = archive.slice(entriesDataRowCount(ws));
+  const index = sheetRowIndex(ws); // content-key -> row number(s) currently in the sheet
+
+  const toRemove = [];
+  for (const [k, rows] of index) if (deletedKeys.has(k)) toRemove.push(...rows);
+  toRemove.sort((a, b) => b - a); // bottom-up, so earlier removals don't shift later row numbers
+  for (const rn of toRemove) ws.spliceRows(rn, 1);
+
+  const missing = archive.filter((row) => {
+    const k = rowKey(row, N);
+    return !index.has(k) && !deletedKeys.has(k);
+  });
+
   const gapsFilled = fillRowGaps(ws);
   const heightsFixed = fixRowHeights(wb);
   for (const row of missing) ws.addRow(row.map(cellValue));
-  if (missing.length === 0 && !gapsFilled && !heightsFixed) return;  // already up to date
+
+  if (missing.length === 0 && toRemove.length === 0 && !gapsFilled && !heightsFixed) return; // already up to date
   await atomicWriteWorkbook(wb);
 }
 
@@ -432,6 +478,23 @@ ipcMain.handle('update-excel-row', async (event, oldRow, newRow) => {
   } catch (e) {
     // Archive already updated; the renderer's pending-sync loop will finish it.
     return { ok: false, recorded: true, matched, error: String(e) };
+  }
+});
+
+// Delete an entry from the working list + Excel. The archive is NEVER trimmed
+// (permanent, recoverable record) - this only tombstones the row's content-key
+// so future reconciles skip and remove it. The tombstone is written first and
+// unconditionally, so the deletion sticks even if Excel can't be reached right
+// now (it gets cleaned up on the next successful writeExcelFromArchive).
+ipcMain.handle('delete-excel-row', async (event, row) => {
+  addDeletedKey(rowKey(row, HEADERS.length));
+
+  const archive = readJSON(ARCHIVE_FILE, []);
+  try {
+    await writeExcelWithRetry(archive);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, recorded: true, error: String(e) };
   }
 });
 

@@ -229,6 +229,11 @@
     font-variant-numeric:tabular-nums;
   }
   .dash-tables td.val::before{ content:"\20b9\00a0"; font-size:10.5px; font-weight:600; color:var(--text-faint); }
+  .dash-tables td.cnt{
+    padding:9px 6px 9px 0; text-align:right; font-size:11px; font-weight:600;
+    color:var(--text-faint); font-variant-numeric:tabular-nums; white-space:nowrap;
+  }
+  .dash-tables td.cnt::before{ content:"\00d7"; margin-right:1px; }
   .dash-tables td:first-child::before{
     content:""; position:absolute; left:0; top:50%; transform:translateY(-50%);
     width:7px; height:7px; border-radius:50%; background:var(--text-faint);
@@ -313,13 +318,15 @@
     position:sticky; left:0; z-index:2; background:var(--surface); border-right:1px solid var(--border);
   }
   table.entries th:first-child{ z-index:3; background:var(--surface-3); }
-  table.entries td.actions-cell{ padding:4px 9px; }
-  .btn-edit{
+  table.entries td.actions-cell{ padding:4px 9px; white-space:nowrap; }
+  .btn-edit, .btn-row-delete{
     cursor:pointer; border:1px solid var(--border-strong); border-radius:6px; padding:4px 11px;
     font-size:10.5px; font-weight:600; background:var(--surface); color:var(--primary);
-    transition:background .15s, color .15s, border-color .15s;
+    transition:background .15s, color .15s, border-color .15s; margin-right:5px;
   }
   .btn-edit:hover{ background:var(--primary); color:var(--primary-ink); border-color:var(--primary); }
+  .btn-row-delete{ color:var(--danger); margin-right:0; }
+  .btn-row-delete:hover{ background:var(--danger); color:#fff; border-color:var(--danger); }
   .empty{ padding:20px; text-align:center; color:var(--text-faint); font-size:12.5px; }
 
   /* ---- Inline form error ---- */
@@ -501,11 +508,11 @@
     <div class="dash-title"><span>Summary</span><span id="dashDate"></span></div>
     <div class="dash-tables">
       <table>
-        <tr><th colspan="2">Collection</th></tr>
-        <tr><td>Cash</td><td class="val" id="collCash">0</td></tr>
-        <tr><td>UPI</td><td class="val" id="collUPI">0</td></tr>
-        <tr><td>Gpay</td><td class="val" id="collGpay">0</td></tr>
-        <tr><td>Pending</td><td class="val" id="collPending">0</td></tr>
+        <tr><th colspan="3">Collection</th></tr>
+        <tr><td>Cash</td><td class="cnt" id="collCashCount">0</td><td class="val" id="collCash">0</td></tr>
+        <tr><td>UPI</td><td class="cnt" id="collUPICount">0</td><td class="val" id="collUPI">0</td></tr>
+        <tr><td>Gpay</td><td class="cnt" id="collGpayCount">0</td><td class="val" id="collGpay">0</td></tr>
+        <tr><td>Pending</td><td class="cnt" id="collPendingCount">0</td><td class="val" id="collPending">0</td></tr>
       </table>
       <table>
         <tr><th colspan="2">Deduction</th></tr>
@@ -552,7 +559,7 @@
     <table class="entries" id="entryTable">
       <thead>
         <tr>
-          <th>Edit</th>
+          <th>Actions</th>
           <th>Date</th><th>Time</th><th>Name</th><th>Mobile</th><th>Type</th><th>Source</th>
           <th>Method</th><th>Location</th><th>Main Service</th><th>Sub Service</th><th>Charge</th>
           <th>Payment Mode</th><th>Pending</th><th>Pending Rec.</th><th>Deductions</th>
@@ -817,7 +824,7 @@ function renderTable(){
   filtered.slice().reverse().forEach((e)=>{
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="actions-cell"><button type="button" class="btn-edit" data-id="${e.id}">✏️ Edit</button></td>
+      <td class="actions-cell"><button type="button" class="btn-edit" data-id="${e.id}">✏️ Edit</button><button type="button" class="btn-row-delete" data-id="${e.id}">🗑</button></td>
       <td>${fmt(e.date)}</td><td>${fmt(e.time)}</td><td>${fmt(e.name)}</td><td>${fmt(e.mobile)}</td>
       <td>${fmt(e.type)}</td><td>${fmt(e.source)}</td><td>${fmt(e.method)}</td><td>${fmt(e.location)}</td>
       <td>${fmt(e.mainService)}</td><td>${fmt(e.subService)}</td><td>${fmt(e.charge)}</td>
@@ -848,11 +855,19 @@ function updateDashDate(storedDate){
 
 function renderSummary(rows){
   const sumBy = (pred, key)=> rows.reduce((s,e)=> pred(e) ? s + (parseFloat(e[key])||0) : s, 0);
+  const countBy = (pred)=> rows.reduce((s,e)=> pred(e) ? s + 1 : s, 0);
 
-  document.getElementById('collCash').textContent = sumBy(e=>e.paymentMode==='Cash','charge').toFixed(2);
-  document.getElementById('collUPI').textContent = sumBy(e=>e.paymentMode==='UPI','charge').toFixed(2);
-  document.getElementById('collGpay').textContent = sumBy(e=>e.paymentMode==='Gpay','charge').toFixed(2);
+  const isCash = e=>e.paymentMode==='Cash', isUPI = e=>e.paymentMode==='UPI', isGpay = e=>e.paymentMode==='Gpay';
+  const hasPending = e=>(parseFloat(e.pending)||0) > 0;
+
+  document.getElementById('collCash').textContent = sumBy(isCash,'charge').toFixed(2);
+  document.getElementById('collCashCount').textContent = countBy(isCash);
+  document.getElementById('collUPI').textContent = sumBy(isUPI,'charge').toFixed(2);
+  document.getElementById('collUPICount').textContent = countBy(isUPI);
+  document.getElementById('collGpay').textContent = sumBy(isGpay,'charge').toFixed(2);
+  document.getElementById('collGpayCount').textContent = countBy(isGpay);
   document.getElementById('collPending').textContent = rows.reduce((s,e)=> s + (parseFloat(e.pending)||0), 0).toFixed(2);
+  document.getElementById('collPendingCount').textContent = countBy(hasPending);
 
   document.getElementById('dedWallet').textContent = sumBy(e=>e.deductions==='Wallet','deductionAmount').toFixed(2);
   document.getElementById('dedBank').textContent = sumBy(e=>e.deductions==='Bank','deductionAmount').toFixed(2);
@@ -964,6 +979,37 @@ async function handleUpdate(){
   cancelEdit();
 }
 
+async function deleteEntry(id){
+  const entry = entries.find(e=>e.id === id);
+  if(!entry) return;
+
+  const label = [entry.name, entry.date, entry.charge ? ('₹' + entry.charge) : ''].filter(Boolean).join(' — ');
+  const ok = confirm('Delete this entry?\n\n' + (label || 'this entry') +
+    '\n\nIt will be removed from this list and Excel. The permanent archive keeps it for recovery if ever needed.');
+  if(!ok) return;
+
+  if(editingId === id) cancelEdit();
+
+  const row = buildRow(entry);
+  entries = entries.filter(e=>e.id !== id);
+  await saveEntries();
+
+  try{
+    const res = await window.api.deleteExcelRow(row);
+    if(!res || !res.ok){
+      excelSyncPending = true;
+      showToast('🗑 Entry deleted — Excel will update when the file is closed');
+    }else{
+      showToast('🗑 Entry deleted');
+    }
+  }catch(e){
+    excelSyncPending = true;
+    showToast('⚠️ Entry deleted, but Excel update failed');
+  }
+
+  renderTable();
+}
+
 document.getElementById('entryForm').addEventListener('submit', async (ev)=>{
   ev.preventDefault();
 
@@ -1024,8 +1070,10 @@ document.getElementById('resetBtn').addEventListener('click', ()=>{
 });
 document.getElementById('cancelEditBtn').addEventListener('click', cancelEdit);
 document.getElementById('tableBody').addEventListener('click', (ev)=>{
-  const btn = ev.target.closest('.btn-edit');
-  if(btn) startEdit(btn.dataset.id);
+  const editBtn = ev.target.closest('.btn-edit');
+  if(editBtn){ startEdit(editBtn.dataset.id); return; }
+  const delBtn = ev.target.closest('.btn-row-delete');
+  if(delBtn){ deleteEntry(delBtn.dataset.id); }
 });
 
 document.getElementById('searchBox').addEventListener('input', renderTable);
